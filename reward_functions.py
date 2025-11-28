@@ -217,13 +217,13 @@ def create_reward_function(reward_type: str, config: Dict = None) -> RewardFunct
 REWARD_CONFIGS = {
     'conservative': {
         'reward_type': 'icm_survival',
-        'survival_weight': 0.2,
+        'survival_weight': 0.0,  # Removed: prevents AI from artificially prolonging games
         'victory_bonus': 50,
         'icm_scale': 100,
     },
     'balanced': {
         'reward_type': 'icm_survival',
-        'survival_weight': 0.1,
+        'survival_weight': 0.0,  # Removed: focuses on chip EV and winning, not game length
         'victory_bonus': 50,
         'icm_scale': 100,
     },

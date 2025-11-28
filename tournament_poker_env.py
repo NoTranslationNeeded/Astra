@@ -2,19 +2,13 @@
 Tournament-style Poker Environment
 Multiple hands until one player's stack reaches 0
 With blind level escalation and randomized starting stacks
+
+Pure Dense Reward: (chip_payoff / BB) / 250.0
+Ultra-Fast Equity: ompeval C++ multithreaded Monte Carlo
 """
 import rlcard
 import numpy as np
-
-# eval7 is optional - only needed for equity calculation
-try:
-    import eval7
-    HAS_EVAL7 = True
-except ImportError:
-    HAS_EVAL7 = False
-    print("! eval7 not available - equity calculation disabled (using fixed 0.5)")
-
-from reward_functions import create_reward_function, REWARD_CONFIGS
+import ompeval  # Ultra-fast C++ Monte Carlo equity calculation
 
 class TournamentPokerEnv:
     """
@@ -29,12 +23,8 @@ class TournamentPokerEnv:
         self.base_big_blind = big_blind
         self.randomize_stacks = randomize_stacks
         
-        # Reward function configuration
-        self.reward_type = reward_type
-        if reward_config is None:
-            reward_config = REWARD_CONFIGS.get('balanced', {})
-            reward_config['big_blind'] = big_blind
-        self.reward_function = create_reward_function(reward_type, reward_config)
+        # Pure Dense Reward: No complex reward functions needed
+        # reward_type and reward_config parameters kept for backward compatibility
         
         # Blind level structure: Fixed at 125/250 for Deep Stack play
         # The user requested BB to be fixed at 250.
@@ -231,6 +221,18 @@ class TournamentPokerEnv:
         else:
             # Default fixed deep stack (25000 chips, 100/200 blinds)
             self.chips = [25000.0, 25000.0]
+            self.starting_chips = self.chips.copy()
+            self.current_blind_level = 0
+            self.small_blind = self.base_small_blind
+            self.big_blind = self.base_big_blind
+        
+        # Reset tournament state
+        self.hand_count = 0
+        self.tournament_over = False
+        
+        # Start first hand and return initial observation
+        self.current_dealer_id = 0  # First hand starts with player 0 as dealer
+        return self._start_new_hand()
 
     def _process_state(self, state, player_id):
         """
@@ -423,11 +425,9 @@ class TournamentPokerEnv:
         # Base observation (54 elements)
         base_obs = state['obs']
         
-        # Calculate equity (0.5 if eval7 not available)
-        try:
-            equity = self._calculate_equity(state, player_id)
-        except:
-            equity = 0.5
+        # Calculate hand equity using Monte Carlo simulation
+        equity = self._calculate_equity(state, player_id)
+
         
         # Chip information (normalized)
         # Normalize by max possible starting chips (50000) or current pot context
@@ -457,31 +457,44 @@ class TournamentPokerEnv:
         return obs
     
     def _calculate_equity(self, state, player_id):
-        """Calculate hand equity using eval7 (if available)"""
-        if not HAS_EVAL7:
-            return 0.5  # Neutral equity if eval7 not available
+        """Ultra-fast C++ Monte Carlo equity with ompeval (10-30x faster than Python loop)"""
+        # Get hand and community cards
+        raw_obs = state['raw_obs']
+        hand = raw_obs['hand']
+        public_cards = raw_obs['public_cards']
         
-        try:
-            # Get hand and community cards
-            raw_obs = state['raw_obs']
-            hand = raw_obs['hand']
-            public_cards = raw_obs['public_cards']
-            
-            # Convert to eval7 format
-            hand_eval7 = [self._card_to_eval7(c) for c in hand]
-            public_eval7 = [self._card_to_eval7(c) for c in public_cards]
-            
-            # Monte Carlo simulation
-            equity = eval7.py_hand_vs_range_monte_carlo(
-                hand_eval7,
-                eval7.HandRange("xx"),
-                public_eval7,
-                100
-            )
-            
-            return equity
-        except:
-            return 0.5
+        # Convert RLCard format ('SA') to ompeval format ('As')
+        hand_str = "".join([self._card_to_ompeval(c) for c in hand])
+        board_str = "".join([self._card_to_ompeval(c) for c in public_cards])
+        
+        # Create hand ranges
+        ranges = [
+            ompeval.CardRange(hand_str),      # Our hand
+            ompeval.CardRange("random"),      # vs random opponent
+        ]
+        
+        # Convert board to bitmask (C++ native format)
+        board_mask = ompeval.CardRange.getCardMask(text=board_str)
+        dead_mask = ompeval.CardRange.getCardMask(text="")  # No dead cards
+        
+        # C++ multithreaded equity calculator
+        eq_calc = ompeval.EquityCalculator()
+        eq_calc.set_hand_limit(100)  # Monte Carlo trials (fast enough with C++)
+        
+        # Start C++ calculation (multithreaded!)
+        eq_calc.start(
+            hand_ranges=ranges,
+            board_cards=board_mask,
+            dead_cards=dead_mask,
+            enumerate_all=False  # Monte Carlo mode
+        )
+        
+        # Wait for completion
+        eq_calc.wait()
+        
+        # Get result
+        result = eq_calc.get_results()
+        return result.equity[0]  # Our hand's equity
     
     def _extract_card_info(self, state):
         """Extract card information from RLCard state"""
@@ -516,18 +529,16 @@ class TournamentPokerEnv:
                 'community': []
             }
     
-    def _card_to_eval7(self, card_str):
-        """Convert RLCard card string to eval7.Card"""
-        if not HAS_EVAL7:
-            return None
+    def _card_to_ompeval(self, card_str):
+        """Convert RLCard card string (e.g. 'SA') to ompeval format (e.g. 'As')"""
+        # RLCard format: 'SA' (Suit + Rank)
+        # ompeval format: 'As' (Rank + suit lowercase)
+        suit_map = {'S': 's', 'H': 'h', 'D': 'd', 'C': 'c'}
         
-        rank_map = {'A': 14, 'K': 13, 'Q': 12, 'J': 11, 'T': 10}
-        suit_map = {'S': 1, 'H': 2, 'D': 4, 'C': 8}
-        
-        rank = rank_map.get(card_str[1], int(card_str[1]))
         suit = suit_map[card_str[0]]
+        rank = card_str[1]  # T, J, Q, K, A or 2-9
         
-        return eval7.Card(rank * 4 + suit - 5)
+        return f"{rank}{suit}"
     
     def get_legal_actions(self):
         """Get currently legal actions from stored state"""
