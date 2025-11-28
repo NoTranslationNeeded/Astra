@@ -359,12 +359,37 @@ class TournamentPokerEnv:
             # Filter and Map to Agent Actions
             agent_legal = []
             
-            # Check Stage for Pre-flop masking (REMOVED as per user request)
-            # User requested ALL 7 actions to be available at ALL times.
+            # Robustness: Try to get game state for physical checks
+            current_pot = 0
+            my_stack = 0
+            check_chips = False
+            
+            try:
+                if self.base_env and hasattr(self.base_env, 'game'):
+                    current_pot = self.base_env.game.dealer.pot
+                    my_stack = self.base_env.game.players[self.current_player].remained_chips
+                    check_chips = True
+            except Exception:
+                # If we can't access game state, fall back to allowing all actions
+                # This prevents crashes during initialization or edge cases
+                check_chips = False
             
             for action_id in rlcard_legal:
                 if action_id in self.rlcard_to_agent_action:
                     agent_action = self.rlcard_to_agent_action[action_id]
+                    
+                    # [Physical Safety] Check if we have enough chips for the bet
+                    # 0(Fold), 1(Call), 6(All-in) are always allowed if RLCard says so
+                    if check_chips and agent_action in [2, 3, 4, 5]:
+                        # Bet ratios: 33%, 75%, 100%, 150%
+                        ratios = {2: 0.33, 3: 0.75, 4: 1.0, 5: 1.5}
+                        amount_needed = current_pot * ratios[agent_action]
+                        
+                        # If bet amount >= stack, we should use All-in instead
+                        # So disable this specific bet size button
+                        if amount_needed >= my_stack:
+                            continue
+                    
                     agent_legal.append(agent_action)
             
             return sorted(agent_legal)
