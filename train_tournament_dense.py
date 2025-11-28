@@ -5,7 +5,7 @@ Uses advanced reward functions for better tournament strategy learning
 import ray
 from ray import tune
 from ray.rllib.algorithms.ppo import PPOConfig
-from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
+# from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv # Removed
 from ray.rllib.models import ModelCatalog
 from ray.tune.registry import register_env
 from ray.air.integrations.mlflow import MLflowLoggerCallback
@@ -17,7 +17,7 @@ import numpy as np
 # Import our custom environment and model
 from tournament_pettingzoo import TournamentPokerParallelEnv
 from transformer_model import TransformerPokerModel
-from tournament_logger import TournamentLoggingCallback
+# from tournament_logger import TournamentLoggingCallback  # Removed to eliminate overhead
 
 # Register custom Transformer model
 ModelCatalog.register_custom_model("transformer_poker", TransformerPokerModel)
@@ -33,7 +33,7 @@ def env_creator(config):
     return env
 
 # Register environment
-register_env("tournament_poker_dense", lambda config: ParallelPettingZooEnv(env_creator(config)))
+register_env("tournament_poker_dense", env_creator)
 
 
 def train_tournament_dense():
@@ -52,11 +52,12 @@ def train_tournament_dense():
     config = (
         PPOConfig()
         .environment(
-            "tournament_poker_dense",
-            env_config={}
+            env="tournament_poker_dense",
+            # Environment config is clean now
         )
-        .framework("torch")
-        .env_runners(num_env_runners=4)  # 4 runners for faster data collection
+        .resources(
+            num_gpus=1, 
+        )
         .training(
             model={
                 "custom_model": "transformer_poker",
@@ -74,10 +75,15 @@ def train_tournament_dense():
             lambda_=0.95,              # GAE lambda for advantage estimation
             clip_param=0.2,            # PPO clip range (conservative for Dense Reward)
             lr=0.0003,
-            train_batch_size=4000,     # Optimized for Dense Reward (was 8000)
+            train_batch_size=2000,     # Reduced from 4000 to prevent OOM
             # sgd_minibatch_size=256,  # Removed due to TypeError in Ray 2.52
             num_sgd_iter=10,
             entropy_coeff=0.02,        # Increased exploration for 7-action space (was 0.01)
+        )
+        .env_runners(
+            num_env_runners=0,     # 0 for local worker (debugging serialization issues)
+            rollout_fragment_length=1000, # Reduced from 4000 to prevent OOM
+            batch_mode="complete_episodes", # Wait for full episodes
         )
         .multi_agent(
             policies={
@@ -87,7 +93,8 @@ def train_tournament_dense():
             policy_mapping_fn=lambda agent_id, *args, **kwargs: agent_id,
             policies_to_train=["player_0", "player_1"],
         )
-        .callbacks(TournamentLoggingCallback)
+        # Removed TournamentLoggingCallback - causes 9+ second overhead per iteration
+        # .callbacks(TournamentLoggingCallback)
         .experimental(_validate_config=False)
     )
     
@@ -126,18 +133,20 @@ def train_tournament_dense():
     # Run training
     results = tune.run(
         "PPO",
-        name="deepstack_7actions_dense_v3_ompeval",
+        name="beta",  # New model name requested by user
         config=config.to_dict(),
         stop=stop,
         checkpoint_freq=10,
         storage_path=os.path.abspath("./ray_results"),
         verbose=1,
+        # resources_per_trial removed to avoid conflict with PPOConfig.learners()
+        # The .learners(num_gpus_per_learner=1) config handles GPU allocation automatically
         callbacks=[
-            MLflowLoggerCallback(
-                tracking_uri="file:./mlruns",
-                experiment_name="deepstack_7actions_dense_v3_ompeval",
-                save_artifact=True,
-            ),
+            # MLflowLoggerCallback(
+            #     tracking_uri="file:./mlruns",
+            #     experiment_name="deepstack_7actions_dense_v3_ompeval",
+            #     save_artifact=True,
+            # ),
         ],
     )
     

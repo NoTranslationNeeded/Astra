@@ -40,93 +40,27 @@ game_logger = setup_game_logger()
 
 class TournamentLoggingCallback(DefaultCallbacks):
     """
-    Custom callback that logs detailed tournament information
-    for the first episode of each training iteration
-    """
-    
-    def __init__(self):
-        super().__init__()
-        self.episode_count = 0
-        self.current_iteration = 0
-        self.iteration_first_episode = None  # Track first episode of current iteration
-        self.pending_log = None  # Store episode data for logging
-        
-    def on_episode_start(
-        self,
-        *,
-        episode: Union[EpisodeV2, SingleAgentEpisode],
-        **kwargs
-    ):
-        """Called at the start of each episode (tournament)"""
-        # Initialize tournament log
-        # Use custom_data for SingleAgentEpisode compatibility
-        data = episode.custom_data if hasattr(episode, "custom_data") else episode.user_data
-        
-        data["tournament_log"] = []
-        data["hand_count"] = 0
-        data["starting_chips"] = None
-        data["blind_level_changes"] = []
-        
-    def on_episode_step(
-        self,
-        *,
-        episode: Union[EpisodeV2, SingleAgentEpisode],
-        **kwargs
-    ):
-        """Called at each step"""
-        # Get info from last step
-        # SingleAgentEpisode uses get_infos() or similar, but let's try last_info_for first
-        # If it's SingleAgentEpisode, it might not have last_info_for
-        if hasattr(episode, "last_info_for"):
-            info = episode.last_info_for()
-        elif hasattr(episode, "get_infos"):
-            # For SingleAgentEpisode, get the last info
+            # Ray 2.x MultiAgentEpisode
             try:
-                info = episode.get_infos(-1)
-            except (IndexError, KeyError):
-                info = {}
-        else:
-            info = {}
+                info = episode.last_info_for("player_0")
+            except (TypeError, KeyError):
+                # Fallback for SingleAgent or if method signature differs
+                try:
+                    info = episode.last_info_for()
+                except:
+                    pass
         
-        if info:
-            data = episode.custom_data if hasattr(episode, "custom_data") else episode.user_data
-            
-            # Record starting chips on first step
-            if data["starting_chips"] is None and "starting_chips" in info:
-                data["starting_chips"] = info["starting_chips"]
-            
-            # Record hand endings
-            if "hand_ended" in info:
-                hand_log = {
-                    "hand_num": data["hand_count"] + 1,
-                    "payoffs": info.get("hand_payoffs", [0, 0]),
-                    "chips": info.get("current_chips", [0, 0]),
-                    "blind_level": info.get("blind_level", 0),
-                    "cards": info.get("cards", {})  # Store card information
-                }
-                data["tournament_log"].append(hand_log)
-                data["hand_count"] += 1
-    
-    def on_episode_end(
-        self,
-        *,
-        episode: Union[EpisodeV2, SingleAgentEpisode],
-        metrics_logger: Optional["MetricsLogger"] = None,
-        **kwargs
-    ):
-        """Called at the end of each episode (tournament)"""
-        self.episode_count += 1
-        
-        # Get final tournament info
-        if hasattr(episode, "last_info_for"):
-            info = episode.last_info_for()
-        elif hasattr(episode, "get_infos"):
+        # Fallback for older API or different episode type
+        if not info and hasattr(episode, "get_infos"):
             try:
-                info = episode.get_infos(-1)
+                infos = episode.get_infos(-1)
+                if isinstance(infos, dict):
+                    if "player_0" in infos:
+                        info = infos["player_0"]
+                    else:
+                        info = infos
             except (IndexError, KeyError):
-                info = {}
-        else:
-            info = {}
+                pass
         
         # Log custom metrics
         if info:
@@ -281,59 +215,5 @@ class TournamentLoggingCallback(DefaultCallbacks):
         algorithm,
         result: dict,
         **kwargs
-    ):
-        """Called after each training iteration"""
-        iteration = result.get("training_iteration", 0)
-        self.current_iteration = iteration
-        
-        # Print detailed log for first tournament of this iteration
-        if self.pending_log is not None:
-            print(f"\n{'='*100}")
-            print(f">>> ITERATION {iteration} - First Tournament (Episode {self.pending_log['episode_number']})")
-            print(f"{'='*100}")
-            self._print_detailed_tournament_log(
-                self.pending_log['episode'],
-                self.pending_log['info']
-            )
-            # Reset for next iteration
-            self.pending_log = None
-            self.iteration_first_episode = None
-        
-        # Print iteration summary
-        print(f"\n{'='*100}")
-        print(f"--- Training Iteration {iteration} Summary")
-        print(f"{'='*100}")
-        print(f"Episodes this iteration: {result.get('episodes_this_iter', 0)}")
-        print(f"Mean reward: {result.get('episode_reward_mean', 0):.2f}")
-        print(f"Mean episode length: {result.get('episode_len_mean', 0):.1f} steps")
-        
-        # Try to get policy loss
-        learner_info = result.get('info', {}).get('learner', {})
-        if learner_info:
-            for policy_id, policy_info in learner_info.items():
-                if 'learner_stats' in policy_info:
-                    stats = policy_info['learner_stats']
-                    if 'policy_loss' in stats:
-                        print(f"Policy loss: {stats['policy_loss']:.4f}")
-                        break
-        
-        # Custom metrics if available
-        custom = result.get('custom_metrics', {})
-        if custom:
-            print(f"\nCustom Metrics:")
-            if 'hands_played_mean' in custom:
-                print(f"  Avg hands per tournament: {custom['hands_played_mean']:.1f}")
-            if 'tournament_winner_mean' in custom:
-                win_rate = custom['tournament_winner_mean']
-                print(f"  Player 0 win rate: {(1-win_rate)*100:.1f}%")
-                print(f"  Player 1 win rate: {win_rate*100:.1f}%")
-        
-        print(f"{'='*100}\n")
-
-
-if __name__ == "__main__":
-    print("Tournament Logging Callback")
-    print("This module provides detailed logging for first tournament of each iteration")
-    print("\nUsage:")
     print("  callbacks = TournamentLoggingCallback()")
     print("  config.callbacks(TournamentLoggingCallback)")

@@ -13,5 +13,5 @@
 - [x] **Verification** <!-- id: 10 -->
     - [x] Test AI performance <!-- id: 11 -->
 - [ ] **Training** <!-- id: 12 -->
-    - [ ] Run Training (DeepStack v3 ompeval) <!-- id: 13 -->
+    - [/] Run Training (DeepStack v3 ompeval + GPU) <!-- id: 13 -->
     - [ ] Monitor Progress (TensorBoard) <!-- id: 14 -->

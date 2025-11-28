@@ -2,12 +2,12 @@
 PettingZoo ParallelEnv wrapper for Tournament Poker Environment
 Enables RLlib to train on tournament-style poker
 """
-from pettingzoo.utils.env import ParallelEnv
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from gymnasium import spaces
 import numpy as np
 from tournament_poker_env import TournamentPokerEnv
 
-class TournamentPokerParallelEnv(ParallelEnv):
+class TournamentPokerParallelEnv(MultiAgentEnv):
     metadata = {
         "render_modes": ["human"],
         "name": "tournament_poker_v1"
@@ -27,9 +27,9 @@ class TournamentPokerParallelEnv(ParallelEnv):
         )
         self.render_mode = render_mode
         
-        # Define agents
+        # Define agents (Ray expects _agent_ids set, but we manage dynamically)
         self.possible_agents = ["player_0", "player_1"]
-        self.agents = self.possible_agents[:]
+        self._agent_ids = set(self.possible_agents)
         
         # Define spaces - 60 dimensions with blind level info
         obs_space = spaces.Box(low=0, high=1, shape=(60,), dtype=np.float32)
@@ -38,7 +38,11 @@ class TournamentPokerParallelEnv(ParallelEnv):
         self.observation_spaces = {agent: obs_space for agent in self.possible_agents}
         self.action_spaces = {agent: act_space for agent in self.possible_agents}
         
-    def reset(self, seed=None, options=None):
+        # Ray expects these to be directly accessible as dicts for MultiAgentEnv
+        self.observation_space = self.observation_spaces
+        self.action_space = self.action_spaces
+        
+    def reset(self, *, seed=None, options=None):
         """Reset the environment"""
         if seed is not None:
             np.random.seed(seed)
@@ -46,31 +50,26 @@ class TournamentPokerParallelEnv(ParallelEnv):
         # Reset underlying env
         obs = self.env.reset()
         
-        # Reset agents
-        self.agents = self.possible_agents[:]
-        
         # Return observations - only current player observes
         current_player = f"player_{self.env.current_player}"
         observations = {current_player: obs}
         
         # Return infos
-        infos = {agent: {} for agent in self.agents}
+        infos = {agent: {} for agent in self.possible_agents}
         
         return observations, infos
     
-    def step(self, actions):
+    def step(self, action_dict):
         """
         Execute actions for agents who are acting this turn
-        
-        In turn-based games like poker, only one agent acts at a time.
-        RLlib will call this with actions dict containing only the acting agent.
+        Ray passes a dictionary: {agent_id: action}
         """
         # Get current acting agent
         current_player = f"player_{self.env.current_player}"
         
         # Execute action if provided
-        if current_player in actions:
-            action = actions[current_player]
+        if current_player in action_dict:
+            action = action_dict[current_player]
             next_obs, reward, done, info = self.env.step(action)
             
             # Prepare returns
@@ -82,20 +81,17 @@ class TournamentPokerParallelEnv(ParallelEnv):
             
             if done:
                 # Tournament over - get final payoffs
-                # Apply BB normalization: (chip_diff / BB) / 250.0
+                # Normalize by MAX_CHIPS (consistent with environment)
+                MAX_CHIPS = 50000.0
                 final_chips = info['final_chips']
                 starting_chips = info['starting_chips']
-                current_bb = self.env.big_blind
                 
                 chip_diff_0 = final_chips[0] - starting_chips[0]
                 chip_diff_1 = final_chips[1] - starting_chips[1]
                 
-                bb_diff_0 = chip_diff_0 / current_bb
-                bb_diff_1 = chip_diff_1 / current_bb
-                
-                # Assign rewards (normalized)
-                rewards["player_0"] = float(bb_diff_0 / 250.0)
-                rewards["player_1"] = float(bb_diff_1 / 250.0)
+                # Assign rewards (normalized by MAX_CHIPS)
+                rewards["player_0"] = float(chip_diff_0 / MAX_CHIPS)
+                rewards["player_1"] = float(chip_diff_1 / MAX_CHIPS)
                 
                 # Mark both as terminated
                 terminations["player_0"] = True
@@ -110,8 +106,10 @@ class TournamentPokerParallelEnv(ParallelEnv):
                 infos["player_0"] = info
                 infos["player_1"] = info
                 
-                # Clear agents
-                self.agents = []
+                # Ray 2.x: Add __all__ to terminations/truncations
+                terminations["__all__"] = True
+                truncations["__all__"] = False
+                
             else:
                 # Game continues
                 next_agent = f"player_{self.env.current_player}"
@@ -123,23 +121,18 @@ class TournamentPokerParallelEnv(ParallelEnv):
                 terminations = {agent: False for agent in self.possible_agents}
                 truncations = {agent: False for agent in self.possible_agents}
                 
+                # Ray 2.x: Add __all__
+                terminations["__all__"] = False
+                truncations["__all__"] = False
+                
                 # Infos
-                infos = {agent: info for agent in self.agents}
+                infos = {agent: info for agent in self.possible_agents}
                 
             return observations, rewards, terminations, truncations, infos
         else:
-            # No action for current player (should not happen)
-            return {}, {}, {}, {}, {}
-    
-    def observation_space(self, agent):
-        return self.observation_spaces[agent]
-    
-    def action_space(self, agent):
-        return self.action_spaces[agent]
-    
-    def close(self):
-        """Cleanup"""
-        pass
+            # No action for current player (should not happen in Ray loop if configured correctly)
+            return {}, {}, {"__all__": False}, {"__all__": False}, {}
+
 
 
 if __name__ == "__main__":

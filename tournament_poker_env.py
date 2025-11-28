@@ -8,7 +8,7 @@ Ultra-Fast Equity: ompeval C++ multithreaded Monte Carlo
 """
 import rlcard
 import numpy as np
-import ompeval  # Ultra-fast C++ Monte Carlo equity calculation
+# import ompeval  # Moved to __init__ to avoid pickling issues with Ray
 
 class TournamentPokerEnv:
     """
@@ -18,10 +18,17 @@ class TournamentPokerEnv:
     
     def __init__(self, starting_chips=100, small_blind=1, big_blind=2, randomize_stacks=True, 
                  reward_type='icm_survival', reward_config=None):
+        # Lazy import ompeval here to ensure it's loaded in the worker process
+        global ompeval
+        import ompeval
+        
         self.base_starting_chips = starting_chips
         self.base_small_blind = small_blind
         self.base_big_blind = big_blind
         self.randomize_stacks = randomize_stacks
+        
+        # Initialize ompeval EquityCalculator once
+        self.equity_calc = ompeval.EquityCalculator()
         
         # Pure Dense Reward: No complex reward functions needed
         # reward_type and reward_config parameters kept for backward compatibility
@@ -31,7 +38,7 @@ class TournamentPokerEnv:
         self.blind_levels = [
             (125, 250),
         ]
-        self.hands_per_level = 999999  # Effectively infinite, blinds do not increase
+        self.hands_per_level = 20  # Blinds increase every 20 hands
         
         # RLCard base environment
         self.base_env = None
@@ -72,19 +79,85 @@ class TournamentPokerEnv:
 
     def step(self, action):
         """Execute one action in the tournament"""
-        # Map Agent Action -> RLCard Action
-        # Reverse of rlcard_to_agent_action
-        # 0->0, 1->1, 3->2, 6->3
-        # Note: If we want to support other bet sizes (2, 4, 5), we need custom logic.
-        # For now, we only map the ones that exist in RLCard's legal actions.
-        rlcard_action = action
-        if action == 3:
-            rlcard_action = 2
-        elif action == 6:
-            rlcard_action = 3
+        # 0. Get Game Info
+        try:
+            game = self.base_env.game
+            current_player = game.players[self.current_player]
+            dealer = game.dealer
+            pot_size = dealer.pot
+            legal_actions = list(self.base_env.get_legal_actions().keys())
+        except AttributeError:
+             # Safety fallback
+             return self._process_state(self.current_state, self.current_player), 0, False, {}
+
+        # 1. Interpret Action & Calculate Amount
+        rlcard_action = 1 # Default: Check/Call
+        
+        # Bet Ratios
+        # Action 2=33%, 3=75%, 4=100%, 5=150%
+        bet_ratios = {2: 0.33, 3: 0.75, 4: 1.0, 5: 1.5}
+
+        # Ensure action is int
+        if hasattr(action, 'item'):
+            action = int(action.item())
+        else:
+            action = int(action)
+
+        if action == 0:   # Fold
+            rlcard_action = 0
+        elif action == 1: # Check/Call
+            rlcard_action = 1
+        elif action == 6: # All-in
+            rlcard_action = 3 # RLCard All-in ID
+        
+        elif action in [2, 3, 4, 5]: # Custom Bet Sizes
+            # Calculate target amount
+            ratio = bet_ratios.get(action, 0.5)
+            additional_bet = int(pot_size * ratio)
             
-        # Execute action in current hand
-        next_state, next_player = self.base_env.step(rlcard_action)
+            # Validation & Clamping
+            # min_raise might be on game or we assume 1 (or big_blind?)
+            # Usually game.min_raise exists.
+            min_raise = getattr(game, 'min_raise', self.big_blind) 
+            my_stack = current_player.remained_chips
+            
+            # Clamp to min_raise
+            if additional_bet < min_raise:
+                additional_bet = min_raise
+            
+            # Check Stack (All-in Logic)
+            if additional_bet >= my_stack:
+                rlcard_action = 3 # Switch to All-in
+            else:
+                # Injection
+                rlcard_action = 2 # Raise
+                
+                try:
+                    # Inject raise_amount
+                    # RLCard usually expects float for amounts in some versions, or int.
+                    # We'll use float as per user suggestion/safety.
+                    self.base_env.game.raise_amount = float(additional_bet)
+                    
+                    # DEBUG: Verify injection
+                    # print(f"DEBUG: Injected raise_amount={self.base_env.game.raise_amount} for Action {action}")
+                except Exception as e:
+                    print(f"[Injection Error] Failed to inject amount: {e}")
+                    rlcard_action = 1 # Fallback to Call
+
+        # 2. Safety Fallback (Masking)
+        if rlcard_action not in legal_actions:
+            # If mapped action is illegal, try fallback
+            if 1 in legal_actions: rlcard_action = 1
+            elif 0 in legal_actions: rlcard_action = 0
+            else: rlcard_action = legal_actions[0]
+
+        # 3. Execute Step
+        try:
+            next_state, next_player = self.base_env.step(rlcard_action)
+        except Exception as e:
+            print(f"[Critical] Engine Error on action {action} (mapped to {rlcard_action}): {e}")
+            # Force Call/Check
+            next_state, next_player = self.base_env.step(1)
         self.current_state = next_state  # Store state for legal actions
         self.current_player = next_player
         
@@ -100,9 +173,8 @@ class TournamentPokerEnv:
             if self.chips[0] <= 0 or self.chips[1] <= 0:
                 self.tournament_over = True
                 
-                # Pure Dense Reward: Even at tournament end, only reward final chip change
-                # This maintains consistency with the chip EV maximization principle
-                # Formula: (chip_payoff / big_blind) / 250.0
+                # Pure Dense Reward: BB-normalized chip change
+                # Formula: (chip_payoff / BB) / 250.0 (already properly normalized to ~[-1, 1])
                 final_reward_0 = (payoffs[0] / self.big_blind) / 250.0
                 final_reward_1 = (payoffs[1] / self.big_blind) / 250.0
                 
@@ -118,13 +190,10 @@ class TournamentPokerEnv:
                 return obs, final_reward_0, done, info
             else:
                 # Tournament continues - start new hand
-                # Dense Reward: Calculate reward for this hand (BB normalization)
-                # Formula: (chip_payoff / big_blind) / 250.0
-                bb_payoff_0 = payoffs[0] / self.big_blind
-                bb_payoff_1 = payoffs[1] / self.big_blind
-                
-                hand_reward_0 = bb_payoff_0 / 250.0
-                hand_reward_1 = bb_payoff_1 / 250.0
+                # Dense Reward: BB-normalized chip change per hand
+                # Formula: (chip_payoff / BB) / 250.0 (already properly normalized to ~[-1, 1])
+                hand_reward_0 = (payoffs[0] / self.big_blind) / 250.0
+                hand_reward_1 = (payoffs[1] / self.big_blind) / 250.0
                 
                 # Extract card information from the ended hand
                 card_info = self._extract_card_info(next_state)
@@ -150,44 +219,56 @@ class TournamentPokerEnv:
             return obs, reward, done, info
 
     def reset(self):
-        """Reset tournament - both players start with randomized chips"""
+        """Reset tournament - Dynamic Hyper-Turbo Mode"""
         if self.randomize_stacks:
-            # Random Stack Depth: 1 to 250 BB
-            bb_depth = np.random.randint(1, 251)
+            # 1. Existing random stack/blind logic
+            # Stack depth: 10 ~ 50 BB (Reduced for faster games)
+            bb_depth = np.random.randint(10, 51)
             
-            # Random Big Blind: 250 to 5000
-            # Ensure even number for integer Small Blind
-            new_bb = np.random.randint(250, 5001)
-            if new_bb % 2 != 0:
-                new_bb += 1
+            # Random starting blind (100 ~ 1000)
+            new_bb = np.random.randint(100, 1001)
+            if new_bb % 2 != 0: new_bb += 1
             new_sb = int(new_bb / 2)
             
-            # Calculate Starting Chips
+            # Set starting chips
             start_chips = bb_depth * new_bb
-            
             self.chips = [float(start_chips), float(start_chips)]
             self.starting_chips = self.chips.copy()
             
-            # Update blind levels for this episode (Fixed for the episode)
-            self.blind_levels = [(new_sb, new_bb)]
+            # [Core Modification] Dynamic Blind Schedule
+            # Generate doubling blinds starting from random new_sb/new_bb
+            self.blind_levels = []
+            curr_sb, curr_bb = new_sb, new_bb
+            
+            # Generate 10 levels (2^10 = 1024x increase, sufficient)
+            for _ in range(10):
+                self.blind_levels.append((curr_sb, curr_bb))
+                curr_sb *= 2
+                curr_bb *= 2
+            
             self.current_blind_level = 0
             self.small_blind = new_sb
             self.big_blind = new_bb
             
+            # [Core Modification] Level up every 5 hands (Hyper-Turbo)
+            self.hands_per_level = 5
+            
         else:
-            # Default fixed deep stack (25000 chips, 100/200 blinds)
-            self.chips = [25000.0, 25000.0]
+            # Fixed stack mode (for testing)
+            self.chips = [2000.0, 2000.0]
             self.starting_chips = self.chips.copy()
+            # Ensure blinds increase in fixed mode too
+            self.blind_levels = [(10, 20), (20, 40), (40, 80), (80, 160), (160, 320)]
             self.current_blind_level = 0
-            self.small_blind = self.base_small_blind
-            self.big_blind = self.base_big_blind
-        
+            self.small_blind = 10
+            self.big_blind = 20
+            self.hands_per_level = 5 # 5 hands here too
+
         # Reset tournament state
         self.hand_count = 0
         self.tournament_over = False
+        self.current_dealer_id = 0
         
-        # Start first hand and return initial observation
-        self.current_dealer_id = 0  # First hand starts with player 0 as dealer
         return self._start_new_hand()
 
     def _start_new_hand(self):
@@ -246,6 +327,7 @@ class TournamentPokerEnv:
         """
         Convert RLCard state to observation vector
         Adds chip information and blind level
+        ALL VALUES NORMALIZED TO 0-1 RANGE (MAX_CHIPS = 50000)
         """
         # Base observation (54 elements)
         base_obs = state['obs']
@@ -254,13 +336,18 @@ class TournamentPokerEnv:
         equity = self._calculate_equity(state, player_id)
 
         
-        # Chip information (normalized)
-        # Normalize by max possible starting chips (50000) or current pot context
+        # Chip information (normalized by MAX_CHIPS = 50000)
         MAX_CHIPS = 50000.0
         my_chips = self.chips[player_id] / MAX_CHIPS
         opp_chips = self.chips[1 - player_id] / MAX_CHIPS
         chip_ratio = my_chips / (my_chips + opp_chips) if (my_chips + opp_chips) > 0 else 0.5
-        pot_ratio = (self.small_blind + self.big_blind) / self.chips[player_id] if self.chips[player_id] > 0 else 0.0
+        
+        # Pot size normalized (blinds are chips, so divide by MAX_CHIPS)
+        pot_size = (self.small_blind + self.big_blind) / MAX_CHIPS
+        
+        # Current blinds normalized
+        small_blind_normalized = self.small_blind / MAX_CHIPS
+        big_blind_normalized = self.big_blind / MAX_CHIPS
         
         # Blind level (normalized 0-1)
         if len(self.blind_levels) > 1:
@@ -268,58 +355,65 @@ class TournamentPokerEnv:
         else:
             blind_level_normalized = 0.0  # Fixed blind level
         
-        # Combine into observation
+        # Combine into observation (60 dimensions)
         obs = np.concatenate([
-            base_obs.flatten(),
-            [equity],
-            [my_chips],
-            [opp_chips],
-            [chip_ratio],
-            [pot_ratio],
-            [blind_level_normalized]
+            base_obs.flatten(),       # 54 dims
+            [equity],                 # 1 dim
+            [my_chips],               # 1 dim
+            [opp_chips],              # 1 dim
+            [chip_ratio],             # 1 dim
+            [pot_size],               # 1 dim (instead of pot_ratio)
+            [blind_level_normalized]  # 1 dim
         ]).astype(np.float32)
+        
+        # Safety check: clip all values to [0, 1] range
+        obs = np.clip(obs, 0.0, 1.0)
         
         return obs
 
     def _calculate_equity(self, state, player_id):
-        """Ultra-fast C++ Monte Carlo equity with ompeval (10-30x faster than Python loop)"""
+        """Calculate hand equity using ompeval C++ EquityCalculator (Ultra-Fast)"""
         # Get hand and community cards
         raw_obs = state['raw_obs']
         hand = raw_obs['hand']
         public_cards = raw_obs['public_cards']
         
-        # Convert RLCard format ('SA') to ompeval format ('As')
-        hand_str = "".join([self._card_to_ompeval(c) for c in hand])
-        board_str = "".join([self._card_to_ompeval(c) for c in public_cards])
+        # If no hand, return 0.5
+        if not hand:
+            return 0.5
         
-        # Create hand ranges
-        ranges = [
-            ompeval.CardRange(hand_str),      # Our hand
-            ompeval.CardRange("random"),      # vs random opponent
-        ]
-        
-        # Convert board to bitmask (C++ native format)
-        board_mask = ompeval.CardRange.getCardMask(text=board_str)
-        dead_mask = ompeval.CardRange.getCardMask(text="")  # No dead cards
-        
-        # C++ multithreaded equity calculator
-        eq_calc = ompeval.EquityCalculator()
-        eq_calc.set_hand_limit(100)  # Monte Carlo trials (fast enough with C++)
-        
-        # Start C++ calculation (multithreaded!)
-        eq_calc.start(
-            hand_ranges=ranges,
-            board_cards=board_mask,
-            dead_cards=dead_mask,
-            enumerate_all=False  # Monte Carlo mode
-        )
-        
-        # Wait for completion
-        eq_calc.wait()
-        
-        # Get result
-        result = eq_calc.get_results()
-        return result.equity[0]  # Our hand's equity
+        # Convert to ompeval strings
+        try:
+            hero_hand_str = "".join([self._card_to_ompeval_str(c) for c in hand])
+            board_str = "".join([self._card_to_ompeval_str(c) for c in public_cards])
+            
+            hero_range = ompeval.CardRange(hero_hand_str)
+            opp_range = ompeval.CardRange("random")
+            board_mask = ompeval.CardRange.getCardMask(board_str)
+            
+            # Use persistent calculator if available, else create new
+            if not hasattr(self, 'equity_calc'):
+                self.equity_calc = ompeval.EquityCalculator()
+                
+            self.equity_calc.start(
+                [hero_range, opp_range],
+                board_mask,
+                0,      # dead cards
+                False,  # enumerate
+                0,      # stdev target
+                None,   # callback
+                0.002,  # update interval
+                1       # threads
+            )
+            self.equity_calc.set_time_limit(0.002) # 2ms time limit
+            self.equity_calc.wait()
+            results = self.equity_calc.get_results()
+            
+            return results.equity[0]
+            
+        except Exception as e:
+            # print(f"Equity Error: {e}")
+            return 0.5  # Safety fallback
     
     def _extract_card_info(self, state):
         """Extract card information from RLCard state"""
@@ -354,60 +448,82 @@ class TournamentPokerEnv:
                 'community': []
             }
     
-    def _card_to_ompeval(self, card_str):
-        """Convert RLCard card string (e.g. 'SA') to ompeval format (e.g. 'As')"""
+    def _card_to_ompeval_str(self, card_str):
+        """Convert RLCard card string (e.g. 'SA') to ompeval string (e.g. 'As')"""
         # RLCard format: 'SA' (Suit + Rank)
         # ompeval format: 'As' (Rank + suit lowercase)
         suit_map = {'S': 's', 'H': 'h', 'D': 'd', 'C': 'c'}
         
-        suit = suit_map[card_str[0]]
+        if len(card_str) < 2: return ""
+        
+        suit = suit_map.get(card_str[0], 's')
         rank = card_str[1]  # T, J, Q, K, A or 2-9
         
         return f"{rank}{suit}"
     
     def get_legal_actions(self):
-        """Get currently legal actions from stored state"""
-        if self.current_state and 'legal_actions' in self.current_state:
-            rlcard_legal = list(self.current_state['legal_actions'].keys())
-            
-            # Filter and Map to Agent Actions
-            agent_legal = []
-            
-            # Robustness: Try to get game state for physical checks
-            current_pot = 0
-            my_stack = 0
-            check_chips = False
-            
-            try:
-                if self.base_env and hasattr(self.base_env, 'game'):
-                    current_pot = self.base_env.game.dealer.pot
-                    my_stack = self.base_env.game.players[self.current_player].remained_chips
-                    check_chips = True
-            except Exception:
-                # If we can't access game state, fall back to allowing all actions
-                # This prevents crashes during initialization or edge cases
-                check_chips = False
-            
+        """
+        Get currently legal actions with 'Smart Masking'
+        Only enables bet sizes that are valid (>= min_raise)
+        """
+        if not self.current_state or 'legal_actions' not in self.current_state:
+            return [0, 1] # Fallback to Fold/Call
+
+        # 1. RLCard legal actions
+        rlcard_legal = list(self.current_state['legal_actions'].keys())
+        print(f"DEBUG: RLCard Legal: {rlcard_legal}") # Uncomment to debug upstream
+        agent_legal = []
+
+        # 2. Get Game State (for physical checks)
+        try:
+            game = self.base_env.game
+            current_player = game.players[self.current_player]
+            pot_size = game.dealer.pot
+            min_raise = getattr(game, 'min_raise', 0) # Minimum raise amount
+            my_stack = current_player.remained_chips
+        except AttributeError:
+            # Safety fallback if game state is inaccessible
             for action_id in rlcard_legal:
                 if action_id in self.rlcard_to_agent_action:
-                    agent_action = self.rlcard_to_agent_action[action_id]
+                    agent_legal.append(self.rlcard_to_agent_action[action_id])
+            return sorted(list(set(agent_legal)))
+
+        # 3. Precise Validation for each button
+        
+        # (1) Fold(0), Check/Call(1) are always valid if RLCard says so
+        if 0 in rlcard_legal: agent_legal.append(0)
+        if 1 in rlcard_legal: agent_legal.append(1)
+        
+        # (2) Bet Options (Action 2~5)
+        # 33%(2), 75%(3), 100%(4), 150%(5)
+        bet_ratios = {2: 0.33, 3: 0.75, 4: 1.0, 5: 1.5}
+        
+        # Can we Raise or All-in?
+        # RLCard: 2=Raise Half Pot (Hijacked), 3=Raise Pot, 4=All-in
+        can_raise_or_allin = (2 in rlcard_legal) or (3 in rlcard_legal) or (4 in rlcard_legal)
+        
+        if can_raise_or_allin:
+            for action_id, ratio in bet_ratios.items():
+                # Calculate expected additional bet
+                calc_amount = int(pot_size * ratio)
+                
+                # Logic: If calculated amount < min_raise, we clamp to min_raise (in step function).
+                # So we should check if the *clamped* amount is valid.
+                effective_amount = max(calc_amount, min_raise)
+                
+                # Condition: Must be affordable (strictly less than stack)
+                # If equal or greater, it falls under All-in (Action 6)
+                is_affordable = (effective_amount < my_stack)
+                
+                if is_affordable:
+                    agent_legal.append(action_id)
                     
-                    # [Physical Safety] Check if we have enough chips for the bet
-                    # 0(Fold), 1(Call), 6(All-in) are always allowed if RLCard says so
-                    if check_chips and agent_action in [2, 3, 4, 5]:
-                        # Bet ratios: 33%, 75%, 100%, 150%
-                        ratios = {2: 0.33, 3: 0.75, 4: 1.0, 5: 1.5}
-                        amount_needed = current_pot * ratios[agent_action]
-                        
-                        # If bet amount >= stack, we should use All-in instead
-                        # So disable this specific bet size button
-                        if amount_needed >= my_stack:
-                            continue
-                    
-                    agent_legal.append(agent_action)
-            
-            return sorted(agent_legal)
-        return []
+        # (3) All-in(6) Check
+        # If Raise or All-in is possible in RLCard, All-in is always an option
+        if can_raise_or_allin:
+            agent_legal.append(6)
+
+        return sorted(agent_legal)
 
 
 if __name__ == "__main__":
@@ -444,10 +560,13 @@ if __name__ == "__main__":
                 break
             
             # Pick random action
+            # legal_actions = env.get_legal_actions() # Redundant
+            # print(f"DEBUG: Legal Actions: {legal_actions}") # Uncomment to see available options
+            
             action = np.random.choice(legal_actions)
             action_name = action_names.get(action, "Unknown")
             
-            print(f"  Hand {env.hand_count} | Player {env.current_player} acts: {action_name} (Action {action})")
+            print(f"  Hand {env.hand_count} | Player {env.current_player} acts: {action_name} (Action {action}) [Legal: {legal_actions}]")
             
             obs, reward, done, info = env.step(action)
             
