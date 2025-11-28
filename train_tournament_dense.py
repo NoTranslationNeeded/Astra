@@ -93,7 +93,7 @@ def train_tournament_dense():
     
     # Training configuration
     stop = {
-        "timesteps_total": 1_000_000,  # 1 Million timesteps (~10-15 min)
+        "timesteps_total": 4_000_000,  # 4 Million timesteps (~60 min)
     }
     
     print("=" * 80)
@@ -157,4 +157,4 @@ def train_tournament_dense():
     ray.shutdown()
 
 if __name__ == "__main__":
-    train_tournament_icm()
+    train_tournament_dense()
