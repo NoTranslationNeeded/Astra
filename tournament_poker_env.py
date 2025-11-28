@@ -40,45 +40,39 @@ class TournamentPokerEnv:
         self.current_blind_level = 0
         self.small_blind = small_blind
         self.big_blind = big_blind
-        
-        # Action and observation space
-        # User requested 7 actions: Fold, Check/Call, 33%, 75%, 100%, 150%, All-in
-        self.action_space_size = 7
-        self.observation_space_size = 55 + 5  # 55 (base) + 5 (equity + chip info + blind level)
-        
-        # Action Mapping: Agent Action Index -> RLCard Action ID
-        # RLCard Actions: 
-        # 0: FOLD, 1: CHECK_CALL, 2: HALF_POT (Unused), 3: POT, 4: ALL_IN
-        # 5: 33_POT, 6: 75_POT, 7: 150_POT
-        self.action_mapping = {
-            0: 0,  # Fold
-            1: 1,  # Check/Call
-            2: 5,  # 33% Pot
-            3: 6,  # 75% Pot
-            4: 3,  # 100% Pot
-            5: 7,  # 150% Pot
-            6: 4   # All-in
-        }
-        # Reverse mapping for legal action calculation
-        self.rlcard_to_agent_action = {v: k for k, v in self.action_mapping.items()}
-        
-        self.current_player = 0
-        self.current_state = None  # Store current rlcard state
+        self.current_dealer_id = 0
         self.tournament_over = False
-
-    # ... (reset and _start_new_hand methods remain unchanged) ...
+        
+        # Action mapping
+        # 0: Fold
+        # 1: Check/Call
+        # 2: Bet 33% Pot (New)
+        # 3: Bet 75% Pot (Was Raise Half Pot)
+        # 4: Bet 100% Pot (Was Raise Pot)
+        # 5: Bet 150% Pot (New)
+        # 6: All-in
+        self.rlcard_to_agent_action = {
+            0: 0, # Fold
+            1: 1, # Check/Call
+            2: 3, # Raise -> Bet 75% (Default raise in RLCard is usually half pot, mapping to 75% slot)
+            3: 6, # All-in -> All-in
+            # Note: RLCard's default 'raise' is limited. 
+            # We will handle custom bet sizes by modifying the environment or action interpretation
+            # For now, we map available RLCard actions to our discrete space
+        }
+        
+        # Observation space
+        # 54 (RLCard default) + 1 (Equity) + 2 (Chip stacks) + 1 (Chip ratio) + 1 (Pot ratio) + 1 (Blind level)
+        self.observation_space_size = 60
+        self.current_state = None
+        self.current_player = 0
 
     def step(self, action):
         """Execute one action in the tournament"""
-        # Map agent action (0-6) to RLCard action ID
-        rlcard_action = self.action_mapping.get(action, 1) # Default to Check/Call if invalid
-        
         # Execute action in current hand
-        next_state, next_player = self.base_env.step(rlcard_action)
+        next_state, next_player = self.base_env.step(action)
         self.current_state = next_state  # Store state for legal actions
         self.current_player = next_player
-        
-        # ... (rest of step method remains unchanged) ...
         
         # Check if hand is over
         if self.base_env.is_over():
@@ -92,27 +86,11 @@ class TournamentPokerEnv:
             if self.chips[0] <= 0 or self.chips[1] <= 0:
                 self.tournament_over = True
                 
-                # Calculate final reward using reward function
-                is_winner_0 = self.chips[0] > 0
-                is_winner_1 = self.chips[1] > 0
-                
-                final_reward_0 = self.reward_function.calculate(
-                    current_chips=self.chips[0],
-                    starting_chips=self.starting_chips[0],
-                    opponent_chips=self.chips[1],
-                    opponent_starting_chips=self.starting_chips[1],
-                    hands_played=self.hand_count,
-                    is_winner=is_winner_0
-                )
-                
-                final_reward_1 = self.reward_function.calculate(
-                    current_chips=self.chips[1],
-                    starting_chips=self.starting_chips[1],
-                    opponent_chips=self.chips[0],
-                    opponent_starting_chips=self.starting_chips[0],
-                    hands_played=self.hand_count,
-                    is_winner=is_winner_1
-                )
+                # Pure Dense Reward: Even at tournament end, only reward final chip change
+                # This maintains consistency with the chip EV maximization principle
+                # Formula: (chip_payoff / big_blind) / 250.0
+                final_reward_0 = (payoffs[0] / self.big_blind) / 250.0
+                final_reward_1 = (payoffs[1] / self.big_blind) / 250.0
                 
                 obs = np.zeros(self.observation_space_size, dtype=np.float32)
                 done = True
@@ -157,46 +135,10 @@ class TournamentPokerEnv:
             
             return obs, reward, done, info
 
-    # ... (_process_state, _calculate_equity, _extract_card_info, _card_to_eval7 methods remain unchanged) ...
-
-    def get_legal_actions(self):
-        """Get currently legal actions from stored state"""
-        if self.current_state and 'legal_actions' in self.current_state:
-            rlcard_legal = list(self.current_state['legal_actions'].keys())
-            
-            # Filter and Map to Agent Actions
-            agent_legal = []
-            
-            # Check Stage for Pre-flop masking
-            # RLCard Stage: 0=Preflop, 1=Flop, 2=Turn, 3=River
-            # We can access stage from current_state['raw_obs']['stage'] (if available) or env.game.stage
-            is_preflop = False
-            if self.base_env and hasattr(self.base_env, 'game'):
-                 # Stage enum: PREFLOP=0
-                 if self.base_env.game.stage == 0: 
-                     is_preflop = True
-            
-            for action_id in rlcard_legal:
-                if action_id in self.rlcard_to_agent_action:
-                    agent_action = self.rlcard_to_agent_action[action_id]
-                    
-                    # Pre-flop Masking Rule:
-                    # Allowed: Fold(0), Check/Call(1), 75%(3), 100%(4), All-in(6)
-                    # Forbidden: 33%(2), 150%(5)
-                    if is_preflop:
-                        if agent_action in [2, 5]: # 33% and 150%
-                            continue
-                            
-                    agent_legal.append(agent_action)
-            
-            return sorted(agent_legal)
-        return []
-        
     def reset(self):
         """Reset tournament - both players start with randomized chips"""
-        # Randomize starting stacks for better generalization
         if self.randomize_stacks:
-            # Variable Stack Depth: 1 BB to 250 BB
+            # Random Stack Depth: 1 to 250 BB
             bb_depth = np.random.randint(1, 251)
             
             # Random Big Blind: 250 to 5000
@@ -234,58 +176,6 @@ class TournamentPokerEnv:
         self.current_dealer_id = 0  # First hand starts with player 0 as dealer
         return self._start_new_hand()
 
-    def _process_state(self, state, player_id):
-        """
-        Convert RLCard state to observation vector
-        Adds chip information and blind level
-        """
-        # Base observation (54 elements)
-        base_obs = state['obs']
-        
-        # Calculate equity (0.5 if eval7 not available)
-        try:
-            equity = self._calculate_equity(state, player_id)
-        except:
-            equity = 0.5
-        
-        # Chip information (normalized)
-        # Normalize by Max Possible Depth (250 BB) relative to current Big Blind
-        # This makes the input "How many BBs do I have?" scaled to 0-1 range (where 1 = 250 BB)
-        # If chips > 250 BB (e.g. after winning), it can go > 1.0, which is fine.
-        MAX_BB_DEPTH = 250.0
-        current_bb = self.big_blind
-        
-        my_chips_bb = (self.chips[player_id] / current_bb)
-        opp_chips_bb = (self.chips[1 - player_id] / current_bb)
-        
-        my_chips_norm = my_chips_bb / MAX_BB_DEPTH
-        opp_chips_norm = opp_chips_bb / MAX_BB_DEPTH
-        
-        chip_ratio = my_chips_norm / (my_chips_norm + opp_chips_norm) if (my_chips_norm + opp_chips_norm) > 0 else 0.5
-        
-        # Pot ratio: Pot / My Chips
-        # If I have 0 chips, pot ratio is effectively infinite (cap at 10?)
-        pot_ratio = (self.small_blind + self.big_blind) / self.chips[player_id] if self.chips[player_id] > 0 else 10.0
-        
-        # Blind level (normalized 0-1)
-        if len(self.blind_levels) > 1:
-            blind_level_normalized = self.current_blind_level / (len(self.blind_levels) - 1)
-        else:
-            blind_level_normalized = 0.0  # Fixed blind level
-        
-        # Combine into observation
-        obs = np.concatenate([
-            base_obs.flatten(),
-            [equity],
-            [my_chips_norm],
-            [opp_chips_norm],
-            [chip_ratio],
-            [pot_ratio],
-            [blind_level_normalized]
-        ]).astype(np.float32)
-        
-        return obs
-    
     def _start_new_hand(self):
         """Start a new hand within the tournament"""
         self.hand_count += 1
@@ -337,86 +227,7 @@ class TournamentPokerEnv:
         obs = self._process_state(state, player_id)
         
         return obs
-    
-    def step(self, action):
-        """Execute one action in the tournament"""
-        # Execute action in current hand
-        next_state, next_player = self.base_env.step(action)
-        self.current_state = next_state  # Store state for legal actions
-        self.current_player = next_player
-        
-        # Check if hand is over
-        if self.base_env.is_over():
-            # Hand finished - update chips
-            payoffs = self.base_env.get_payoffs()
-            
-            self.chips[0] += payoffs[0]
-            self.chips[1] += payoffs[1]
-            
-            # Check if tournament is over
-            if self.chips[0] <= 0 or self.chips[1] <= 0:
-                self.tournament_over = True
-                
-                # Calculate final reward using reward function
-                is_winner_0 = self.chips[0] > 0
-                is_winner_1 = self.chips[1] > 0
-                
-                final_reward_0 = self.reward_function.calculate(
-                    current_chips=self.chips[0],
-                    starting_chips=self.starting_chips[0],
-                    opponent_chips=self.chips[1],
-                    opponent_starting_chips=self.starting_chips[1],
-                    hands_played=self.hand_count,
-                    is_winner=is_winner_0
-                )
-                
-                final_reward_1 = self.reward_function.calculate(
-                    current_chips=self.chips[1],
-                    starting_chips=self.starting_chips[1],
-                    opponent_chips=self.chips[0],
-                    opponent_starting_chips=self.starting_chips[0],
-                    hands_played=self.hand_count,
-                    is_winner=is_winner_1
-                )
-                
-                obs = np.zeros(self.observation_space_size, dtype=np.float32)
-                done = True
-                info = {
-                    'tournament_winner': 0 if self.chips[0] > 0 else 1,
-                    'hands_played': self.hand_count,
-                    'final_chips': self.chips.copy(),
-                    'starting_chips': self.starting_chips.copy()
-                }
-                
-                return obs, final_reward_0, done, info
-            else:
-                # Tournament continues - start new hand
-                hand_reward_0 = 0.0
-                hand_reward_1 = 0.0
-                
-                # Extract card information from the ended hand
-                card_info = self._extract_card_info(next_state)
-                
-                obs = self._start_new_hand()
-                done = False
-                info = {
-                    'hand_ended': True,
-                    'hand_payoffs': payoffs,
-                    'current_chips': self.chips.copy(),
-                    'blind_level': self.current_blind_level,
-                    'cards': card_info
-                }
-                
-                return obs, hand_reward_0, done, info
-        else:
-            # Hand continues
-            obs = self._process_state(next_state, next_player)
-            reward = 0.0
-            done = False
-            info = {}
-            
-            return obs, reward, done, info
-    
+
     def _process_state(self, state, player_id):
         """
         Convert RLCard state to observation vector
@@ -455,7 +266,7 @@ class TournamentPokerEnv:
         ]).astype(np.float32)
         
         return obs
-    
+
     def _calculate_equity(self, state, player_id):
         """Ultra-fast C++ Monte Carlo equity with ompeval (10-30x faster than Python loop)"""
         # Get hand and community cards
