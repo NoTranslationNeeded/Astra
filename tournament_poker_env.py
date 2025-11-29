@@ -17,7 +17,7 @@ class TournamentPokerEnv:
     """
     
     def __init__(self, starting_chips=100, small_blind=1, big_blind=2, randomize_stacks=True, 
-                 reward_type='icm_survival', reward_config=None, max_hands=1000):
+                 reward_type='icm_survival', reward_config=None, max_hands=1000, max_steps_per_hand=10):
         # Lazy import ompeval here to ensure it's loaded in the worker process
         global ompeval
         import ompeval
@@ -26,7 +26,9 @@ class TournamentPokerEnv:
         self.base_small_blind = small_blind
         self.base_big_blind = big_blind
         self.randomize_stacks = randomize_stacks
+        self.randomize_stacks = randomize_stacks
         self.max_hands = max_hands
+        self.max_steps_per_hand = max_steps_per_hand
         
         # Initialize ompeval EquityCalculator once
         self.equity_calc = ompeval.EquityCalculator()
@@ -49,7 +51,9 @@ class TournamentPokerEnv:
         self.small_blind = small_blind
         self.big_blind = big_blind
         self.current_dealer_id = 0
+        self.current_dealer_id = 0
         self.tournament_over = False
+        self.steps_in_hand = 0
         
         # Action mapping
         # 0: Fold
@@ -80,16 +84,26 @@ class TournamentPokerEnv:
 
     def step(self, action):
         """Execute one action in the tournament"""
+        # [Infinite Loop Fix] Enforce max steps per hand
+        self.steps_in_hand += 1
+        if self.steps_in_hand >= self.max_steps_per_hand:
+            # Force Check/Call to end the hand
+            # print(f"[Limit] Max steps ({self.max_steps_per_hand}) reached. Forcing Check/Call.")
+            action = 1 
+            
         # 0. Get Game Info
         try:
             game = self.base_env.game
             current_player = game.players[self.current_player]
             dealer = game.dealer
             pot_size = dealer.pot
-            legal_actions = list(self.base_env.get_legal_actions().keys())
-        except AttributeError:
-             # Safety fallback
-             return self._process_state(self.current_state, self.current_player), 0, False, {}
+            # Use current_state to get legal actions (RLCard pattern)
+            legal_actions = list(self.current_state.get('legal_actions', {1: None}).keys()) if self.current_state else [0, 1]
+        except (AttributeError, TypeError) as e:
+             # Safety fallback - Critical Error, end episode to avoid infinite loop
+             print(f"DEBUG: Error caught! {e}")
+             # Return done=True to exit this broken state
+             return np.zeros(self.observation_space_size, dtype=np.float32), 0, True, {'error': str(e)}
 
         # 1. Interpret Action & Calculate Amount
         rlcard_action = 1 # Default: Check/Call
@@ -104,6 +118,8 @@ class TournamentPokerEnv:
         else:
             action = int(action)
 
+ 
+            
         if action == 0:   # Fold
             rlcard_action = 0
         elif action == 1: # Check/Call
@@ -154,7 +170,12 @@ class TournamentPokerEnv:
 
         # 3. Execute Step
         try:
+            print(f"DEBUG: Step Action: {action} -> RLCard: {rlcard_action}, Legal: {legal_actions}")
             next_state, next_player = self.base_env.step(rlcard_action)
+            
+            game = self.base_env.game
+            print(f"DEBUG: Post-Step Pot: {game.dealer.pot}, In Chips: {[p.in_chips for p in game.players]}")
+            
         except Exception as e:
             print(f"[Critical] Engine Error on action {action} (mapped to {rlcard_action}): {e}")
             # Force Call/Check
@@ -276,13 +297,15 @@ class TournamentPokerEnv:
         # Reset tournament state
         self.hand_count = 0
         self.tournament_over = False
-        self.current_dealer_id = 0
+        # Randomize initial dealer (0 or 1)
+        self.current_dealer_id = np.random.randint(0, 2)
         
         return self._start_new_hand()
 
     def _start_new_hand(self):
         """Start a new hand within the tournament"""
         self.hand_count += 1
+        self.steps_in_hand = 0
         
         # Update blind level every hands_per_level hands
         new_blind_level = min(
@@ -303,18 +326,87 @@ class TournamentPokerEnv:
         config = {
             'seed': np.random.randint(0, 100000),
             'game_num_players': 2,
-            'dealer_id': self.current_dealer_id
+            'dealer_id': self.current_dealer_id,
         }
         self.base_env = rlcard.make('no-limit-holdem', config=config)
         
         # [NEW] Configure blinds explicitly
+        # Try to set via configure method if available (standard RLCard way)
+        if hasattr(self.base_env.game, 'configure'):
+            game_config = {
+                'game_num_players': 2,
+                'chips': [self.chips[0], self.chips[1]],
+                'small_blind': int(self.small_blind), # Ensure int
+                'big_blind': int(self.big_blind),     # Ensure int
+                'dealer_id': self.current_dealer_id
+            }
+            # Note: configure might reset the game, so we do it before reset()
+            # But rlcard.make() already creates a game. We need to inject blinds.
+            pass
+
+        # Force set attributes
         if hasattr(self.base_env.game, 'small_blind'):
-            self.base_env.game.small_blind = self.small_blind
+            self.base_env.game.small_blind = int(self.small_blind)
         if hasattr(self.base_env.game, 'big_blind'):
-            self.base_env.game.big_blind = self.big_blind
-        
+            self.base_env.game.big_blind = int(self.big_blind)
+            
+        # Also update judger/dealer if they store blind info
+        if hasattr(self.base_env.game, 'judger'):
+            if hasattr(self.base_env.game.judger, 'small_blind'):
+                self.base_env.game.judger.small_blind = int(self.small_blind)
+                
         # Get initial state
         state, player_id = self.base_env.reset()
+        
+        # [CRITICAL] Re-apply blinds to pot if reset() used default values
+        # RLCard reset() posts blinds. If it used old values (1/2), pot will be 3.
+        # We need to check if pot matches our blinds.
+        expected_pot = int(self.small_blind + self.big_blind)
+        current_pot = self.base_env.game.dealer.pot
+        
+        # If pot is wrong (e.g. default 3), we manually fix it
+        # This is a hack because RLCard might not respect attribute changes immediately
+        if current_pot != expected_pot:
+            # print(f"DEBUG: Fixing pot from {current_pot} to {expected_pot}")
+            # IMPORTANT: We set pot to 0 because blinds are in 'in_chips'
+            # play_vs_ai.py calculates Total Pot = dealer.pot + sum(in_chips)
+            self.base_env.game.dealer.pot = 0
+            
+            # Fix player investments (in_chips)
+            # RLCard Issue: In Heads-up, it starts action from (dealer_id + 1) % 2, which is usually BB.
+            # But in Heads-up, SB (Dealer) should act first.
+            # To fix this without changing RLCard internals, we assign SB to the player who acts first.
+            
+            # RLCard starts with: first_actor = 1 - self.current_dealer_id
+            # We want: first_actor = SB
+            
+            sb_player_id = 1 - self.current_dealer_id
+            bb_player_id = self.current_dealer_id
+            
+            sb_player = self.base_env.game.players[sb_player_id]
+            bb_player = self.base_env.game.players[bb_player_id]
+            
+            sb_player.in_chips = int(self.small_blind)
+            bb_player.in_chips = int(self.big_blind)
+            
+            # Update remained chips
+            sb_player.remained_chips = int(self.chips[sb_player_id] - self.small_blind)
+            bb_player.remained_chips = int(self.chips[bb_player_id] - self.big_blind)
+            
+            # DEBUG: Inspect Game Attributes to find "100"
+            # print(f"DEBUG: Game Dict: {self.base_env.game.__dict__}")
+            
+            # [CRITICAL] Update RLCard internal blind info
+            # RLCard uses these to validate bets. If they are default (100/200),
+            # it might think our higher blinds (e.g. 670) are already enough and ignore calls.
+            if hasattr(self.base_env.game, 'big_blind'):
+                self.base_env.game.big_blind = float(self.big_blind)
+            if hasattr(self.base_env.game, 'small_blind'):
+                self.base_env.game.small_blind = float(self.small_blind)
+            
+            # Also ensure judger knows about blinds if it exists
+            if hasattr(self.base_env.game, 'judger') and hasattr(self.base_env.game.judger, 'big_blind'):
+                 self.base_env.game.judger.big_blind = float(self.big_blind)
         
         # [NEW] Synchronize chip stacks
         # rlcard's reset() automatically posts blinds, so we must account for them
@@ -425,37 +517,120 @@ class TournamentPokerEnv:
             return 0.5  # Safety fallback
     
     def _extract_card_info(self, state):
-        """Extract card information from RLCard state"""
+        """Extract card information from RLCard state with Hand Evaluation"""
         try:
             raw_obs = state['raw_obs']
             
             # Get hands for both players (if available)
-            hands = raw_obs.get('all_hands', [raw_obs.get('hand', [])])
+            p0_hand = []
+            p1_hand = []
             
-            # Get community cards
-            public_cards = raw_obs.get('public_cards', [])
+            if hasattr(self.base_env, 'game'):
+                p0_hand = [str(c) for c in self.base_env.game.players[0].hand]
+                p1_hand = [str(c) for c in self.base_env.game.players[1].hand]
+            else:
+                hands = raw_obs.get('all_hands', [])
+                if len(hands) >= 2:
+                    p0_hand = hands[0]
+                    p1_hand = hands[1]
             
-            # Convert card strings to readable format
-            def format_card(card_str):
-                """Convert RLCard format to readable (e.g., 'SA' -> 'As')"""
-                suit_map = {'S': 's', 'H': 'h', 'D': 'd', 'C': 'c'}
-                if len(card_str) >= 2:
-                    suit = suit_map.get(card_str[0], card_str[0])
-                    rank = card_str[1]
-                    return f"{rank}{suit}"
-                return card_str
+            public_cards = [str(c) for c in self.base_env.game.public_cards] if hasattr(self.base_env, 'game') else raw_obs.get('public_cards', [])
             
+            # Evaluate hands using Treys (if available) or basic string
+            p0_rank = "Unknown"
+            p1_rank = "Unknown"
+            
+            try:
+                from treys import Evaluator, Card
+                evaluator = Evaluator()
+                
+                def convert_to_treys(card_strs):
+                    cards = []
+                    # print(f"DEBUG: Converting cards: {card_strs}")
+                    for s in card_strs:
+                        if len(s) < 2: continue
+                        
+                        # Determine which char is suit
+                        suits = ['s', 'h', 'd', 'c', 'S', 'H', 'D', 'C']
+                        valid_ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
+                        
+                        rank = ''
+                        suit = ''
+                        
+                        if s[0] in suits: # SuitRank (e.g. D5)
+                            suit = s[0].lower()
+                            rank = s[1:]
+                        elif s[-1] in suits: # RankSuit (e.g. 5D or 10D)
+                            suit = s[-1].lower()
+                            rank = s[:-1]
+                        
+                        # Treys expects 'T' for 10
+                        if rank == '10': rank = 'T'
+                        rank = rank.upper()
+                        
+                        try:
+                            if rank not in valid_ranks:
+                                # print(f"DEBUG: Invalid rank '{rank}' in card '{s}'")
+                                continue
+                                
+                            cards.append(Card.new(f"{rank}{suit}"))
+                        except Exception as e:
+                            print(f"DEBUG: Error parsing card '{s}' (Rank: {rank}, Suit: {suit}): {e}")
+                            continue
+                    return cards
+
+                board = convert_to_treys(public_cards)
+                if board and len(board) >= 3:
+                    import itertools
+                    
+                    def get_best_hand_cards(evaluator, board, hand_cards):
+                        all_cards = board + hand_cards
+                        min_score = float('inf')
+                        best_five = []
+                        
+                        for five_cards in itertools.combinations(all_cards, 5):
+                            score = evaluator.evaluate(list(five_cards), [])
+                            if score < min_score:
+                                min_score = score
+                                best_five = list(five_cards)
+                        
+                        return min_score, best_five
+
+                    if p0_hand:
+                        h0 = convert_to_treys(p0_hand)
+                        score0, best_five0 = get_best_hand_cards(evaluator, board, h0)
+                        class0 = evaluator.get_rank_class(score0)
+                        p0_rank = evaluator.class_to_string(class0)
+                        p0_best_cards = [Card.int_to_str(c) for c in best_five0]
+                    else:
+                        p0_best_cards = []
+                    
+                    if p1_hand:
+                        h1 = convert_to_treys(p1_hand)
+                        score1, best_five1 = get_best_hand_cards(evaluator, board, h1)
+                        class1 = evaluator.get_rank_class(score1)
+                        p1_rank = evaluator.class_to_string(class1)
+                        p1_best_cards = [Card.int_to_str(c) for c in best_five1]
+                    else:
+                        p1_best_cards = []
+            except ImportError:
+                # print("DEBUG: Treys import failed")
+                pass
+            except Exception as e:
+                # print(f"DEBUG: Hand Eval Error: {e}")
+                pass
+
             return {
-                'player_0_hand': [format_card(c) for c in (hands[0] if len(hands) > 0 else [])],
-                'player_1_hand': [format_card(c) for c in (hands[1] if len(hands) > 1 else [])],
-                'community': [format_card(c) for c in public_cards]
+                'player0': p0_hand,
+                'player1': p1_hand,
+                'public': public_cards,
+                'p0_rank': p0_rank,
+                'p1_rank': p1_rank,
+                'p0_best_cards': locals().get('p0_best_cards', []),
+                'p1_best_cards': locals().get('p1_best_cards', [])
             }
         except Exception as e:
-            return {
-                'player_0_hand': [],
-                'player_1_hand': [],
-                'community': []
-            }
+            return {'player0': [], 'player1': [], 'public': [], 'p0_rank': 'Unknown', 'p1_rank': 'Unknown'}
     
     def _card_to_ompeval_str(self, card_str):
         """Convert RLCard card string (e.g. 'SA') to ompeval string (e.g. 'As')"""
